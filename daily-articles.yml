@@ -1,0 +1,66 @@
+name: Daily articles
+
+# Manual only: Actions tab → "Daily articles" → "Run workflow".
+# (A daily schedule can be added later with an `on.schedule` cron entry.)
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: generate and show the article, but don't save it to Supabase"
+        type: boolean
+        default: true
+
+# Never run two generations at the same time.
+concurrency:
+  group: daily-articles
+  cancel-in-progress: false
+
+# The workflow only needs to read the repository.
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    name: Generate article (${{ inputs.dry_run && 'dry run' || 'save as draft' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Secrets are passed only as environment variables. GitHub masks their values in logs,
+      # and the scripts never print them.
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+    steps:
+      - name: Check required secrets are set
+        # Reports only whether each secret exists — never its value.
+        run: |
+          missing=0
+          for name in ANTHROPIC_API_KEY SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Repository secret $name is not set (Settings → Secrets and variables → Actions)."
+              missing=1
+            else
+              echo "✓ $name is set"
+            fi
+          done
+          exit $missing
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate article
+        run: |
+          if [ "$DRY_RUN" = "1" ]; then
+            echo "Dry run: the article will be shown below and on the run summary page, but NOT saved."
+          else
+            echo "Live run: the article will be saved to Supabase as a DRAFT (never published)."
+          fi
+          node scripts/generate-article.mjs
