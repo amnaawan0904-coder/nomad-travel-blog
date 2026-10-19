@@ -27,6 +27,8 @@ jobs:
     env:
       # Secrets are passed only as environment variables. GitHub masks their values in logs,
       # and the scripts never print them.
+      # AI: Gemini is used when GEMINI_API_KEY is set; otherwise Claude (ANTHROPIC_API_KEY).
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -36,7 +38,7 @@ jobs:
         # Reports only whether each secret exists — never its value.
         run: |
           missing=0
-          for name in ANTHROPIC_API_KEY SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY; do
+          for name in SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY; do
             if [ -z "${!name}" ]; then
               echo "::error::Repository secret $name is not set (Settings → Secrets and variables → Actions)."
               missing=1
@@ -44,6 +46,14 @@ jobs:
               echo "✓ $name is set"
             fi
           done
+          if [ -n "$GEMINI_API_KEY" ]; then
+            echo "✓ GEMINI_API_KEY is set — using Gemini"
+          elif [ -n "$ANTHROPIC_API_KEY" ]; then
+            echo "✓ ANTHROPIC_API_KEY is set — using Claude"
+          else
+            echo "::error::Set a GEMINI_API_KEY (or ANTHROPIC_API_KEY) repository secret."
+            missing=1
+          fi
           exit $missing
 
       - uses: actions/checkout@v4
