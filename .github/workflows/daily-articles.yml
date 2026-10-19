@@ -1,14 +1,21 @@
 name: Daily articles
 
-# Manual only: Actions tab → "Daily articles" → "Run workflow".
-# (A daily schedule can be added later with an `on.schedule` cron entry.)
 on:
+  # Automatic: every day at 06:00 UTC (11:00 in Pakistan). GitHub may start a few minutes late.
+  # Scheduled runs PUBLISH the article (set repository variable AUTO_PUBLISH=false to save drafts instead).
+  schedule:
+    - cron: "0 6 * * *"
+  # Manual: Actions tab → "Daily articles" → "Run workflow".
   workflow_dispatch:
     inputs:
       dry_run:
         description: "Dry run: generate and show the article, but don't save it to Supabase"
         type: boolean
         default: true
+      publish:
+        description: "Publish immediately (otherwise it's saved as a draft). Ignored in a dry run."
+        type: boolean
+        default: false
 
 # Never run two generations at the same time.
 concurrency:
@@ -21,7 +28,7 @@ permissions:
 
 jobs:
   generate:
-    name: Generate article (${{ inputs.dry_run && 'dry run' || 'save as draft' }})
+    name: Generate article
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -34,7 +41,9 @@ jobs:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+      # Manual runs: follow the checkboxes. Scheduled runs: never a dry run.
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '0' }}
+      PUBLISH: ${{ ((github.event_name == 'schedule' && vars.AUTO_PUBLISH != 'false') || (github.event_name == 'workflow_dispatch' && inputs.publish)) && '1' || '0' }}
     steps:
       - name: Check required secrets are set
         # Reports only whether each secret exists — never its value.
@@ -68,11 +77,17 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Publishes any articles you marked 'scheduled' in Supabase whose published_at time has passed.
+      - name: Publish scheduled articles
+        run: node scripts/publish-scheduled.mjs
+
       - name: Generate article
         run: |
           if [ "$DRY_RUN" = "1" ]; then
             echo "Dry run: the article will be shown below and on the run summary page, but NOT saved."
+          elif [ "$PUBLISH" = "1" ]; then
+            echo "Live run: the article will be PUBLISHED and appear on the website."
           else
-            echo "Live run: the article will be saved to Supabase as a DRAFT (never published)."
+            echo "Live run: the article will be saved to Supabase as a DRAFT."
           fi
           node scripts/generate-article.mjs
