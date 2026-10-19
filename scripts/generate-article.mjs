@@ -2,21 +2,24 @@
  * Article generator for Nomad Travel Blog.
  *
  *   1. Loads existing article titles from Supabase (to avoid duplicates).
- *   2. Research step: the AI picks a fresh topic and researches it with web search.
- *   3. Writing step: the AI turns the notes into a structured article (JSON).
+ *   2. Research step: the AI picks a fresh topic and gathers real sources.
+ *      - Gemini (free tier): picks a topic + search terms; the script fetches matching
+ *        Wikivoyage / Wikipedia pages (free, no key) as the only research material.
+ *      - Claude: researches with its built-in web search.
+ *   3. Writing step: the AI turns the research into a structured article (JSON).
  *   4. Validates it (sources, length, slug, no visa/price content) and saves it as a DRAFT.
  *
  * Nothing is ever published by this script — a human reviews drafts in Supabase.
  *
- * AI provider: Gemini when GEMINI_API_KEY is set (free tier: gemini-2.5-flash with Google Search),
- * otherwise Claude via ANTHROPIC_API_KEY. Force one with AI_PROVIDER=gemini|claude.
+ * AI provider: Gemini when GEMINI_API_KEY is set, otherwise Claude via ANTHROPIC_API_KEY.
+ * Force one with AI_PROVIDER=gemini|claude.
  *
  * Env vars (GitHub Actions secrets — never commit these):
  *   GEMINI_API_KEY or ANTHROPIC_API_KEY
  *   SUPABASE_URL               https://<project>.supabase.co
  *   SUPABASE_SERVICE_ROLE_KEY  server-only key that can insert rows (never put it in the website)
  * Optional:
- *   GEMINI_MODEL               defaults to gemini-2.5-flash (free-tier Google Search grounding)
+ *   GEMINI_MODEL               defaults to gemini-3.8-flash (free tier for text)
  *   ANTHROPIC_MODEL            defaults to claude-opus-5-5
  *   DRY_RUN=1                  show the article instead of saving it
  */
@@ -27,7 +30,7 @@ import { createClient } from "@supabase/supabase-js";
 
 const DRY_RUN = process.env.DRY_RUN === "1";
 const PROVIDER = (process.env.AI_PROVIDER || (process.env.GEMINI_API_KEY?.trim() ? "gemini" : "claude")).toLowerCase();
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
 const CLAUDE_MODEL = process.env.ANTHROPIC_MODEL || "claude-opus-5-5";
 const MAX_PAUSE_CONTINUATIONS = 5;
 const MIN_SOURCES = 2;
@@ -123,7 +126,8 @@ ${notes}
 ${sources.map((s, i) => `${i + 1}. ${s.title} — ${s.url}`).join("\n")}
 </sources>
 
-Leave out anything marked (unverified). For source_urls, copy only URLs from the list above that the article relies on.${
+Write in your own words — never copy sentences from the sources. Leave out anything marked (unverified).
+For source_urls, copy only URLs from the list above that the article relies on.${
     feedback ? `\n\nYour previous draft was rejected: ${feedback} Fix this in the new draft.` : ""
   }`;
 }
@@ -161,25 +165,96 @@ function parseArticleJson(text, step) {
   }
 }
 
-/* ---------- Provider: Gemini ---------- */
+/* ---------- Free research sources: Wikivoyage + Wikipedia ---------- */
 
-/**
- * Gemini grounding returns temporary Google redirect links. Follow each one (without
- * downloading the page) to get the real, permanent page address for source_urls.
- */
-async function resolveSourceUrl(uri) {
-  try {
-    const res = await fetch(uri, { method: "GET", redirect: "manual", signal: AbortSignal.timeout(10_000) });
-    const location = res.headers.get("location");
-    await res.body?.cancel();
-    let finalUrl = null;
-    if (res.status >= 300 && res.status < 400 && location) finalUrl = new URL(location, uri).href;
-    else if (res.ok) finalUrl = uri;
-    return finalUrl && /^https?:\/\//i.test(finalUrl) && !/grounding-api-redirect/.test(finalUrl) ? finalUrl : null;
-  } catch {
-    return null;
+const WIKI_HEADERS = { "User-Agent": "NomadTravelBlogBot/1.0 (automated research for a travel blog; GitHub Actions)" };
+const MAX_WIKI_PAGES = 5;
+const MAX_CHARS_PER_PAGE = 6000;
+
+/** Wikivoyage/Wikipedia sections that are about visas or prices — removed before the AI sees them. */
+const EXCLUDED_SECTION = /^(get in|visas?|entry requirements|buy|sleep|budget|mid-?range|splurge|costs?|prices?|fees|money|economy)$/i;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Polite Wikimedia API call: a short pause before each request, and retries when rate-limited. */
+async function wikiApi(site, params) {
+  const url = `https://${site}/w/api.php?${new URLSearchParams({ format: "json", formatversion: "2", ...params })}`;
+  for (let attempt = 1; ; attempt++) {
+    await sleep(500);
+    const res = await fetch(url, { headers: WIKI_HEADERS, signal: AbortSignal.timeout(15_000) });
+    if (res.ok) return res.json();
+    if ((res.status === 429 || res.status >= 500) && attempt < 4) {
+      const retryAfter = Number(res.headers.get("retry-after"));
+      const waitMs = Math.min(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 5000 * attempt, 30_000);
+      console.warn(`${site} is busy (${res.status}); waiting ${Math.round(waitMs / 1000)}s and retrying…`);
+      await res.body?.cancel();
+      await sleep(waitMs);
+      continue;
+    }
+    throw new Error(`${site} returned ${res.status}`);
   }
 }
+
+/** Plain text of a page with visa/price sections removed. */
+function cleanExtract(wikitextSections) {
+  const kept = [];
+  let skipping = false;
+  for (const line of wikitextSections.split("\n")) {
+    const heading = line.match(/^=+\s*(.+?)\s*=+$/);
+    if (heading) {
+      skipping = EXCLUDED_SECTION.test(heading[1]);
+      if (!skipping) kept.push(`## ${heading[1]}`);
+    } else if (!skipping && line.trim()) {
+      kept.push(line.trim());
+    }
+  }
+  return kept.join("\n").slice(0, MAX_CHARS_PER_PAGE);
+}
+
+/** Searches each site for each query and returns up to MAX_WIKI_PAGES distinct pages with text. */
+async function collectWikiSources(queries) {
+  const sources = [];
+  const seen = new Set();
+  for (const { site, query } of queries) {
+    if (sources.length >= MAX_WIKI_PAGES) break;
+    try {
+      const search = await wikiApi(site, { action: "query", list: "search", srsearch: query, srlimit: "2" });
+      for (const hit of search.query?.search ?? []) {
+        if (sources.length >= MAX_WIKI_PAGES) break;
+        const page = (await wikiApi(site, {
+          action: "query", prop: "extracts|info", inprop: "url", explaintext: "1", exsectionformat: "wiki", titles: hit.title,
+        })).query?.pages?.[0];
+        if (!page?.fullurl || seen.has(page.fullurl) || !page.extract) continue;
+        const text = cleanExtract(page.extract);
+        if (text.length < 500) continue; // too thin to be useful
+        seen.add(page.fullurl);
+        sources.push({ url: page.fullurl, title: `${page.title} (${site.startsWith("en.wikivoyage") ? "Wikivoyage" : "Wikipedia"})`, text });
+      }
+    } catch (err) {
+      console.warn(`Skipping "${query}" on ${site}: ${err.message}`);
+    }
+  }
+  return sources;
+}
+
+const PLAN_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["topic", "wikivoyage_searches", "wikipedia_searches"],
+  properties: {
+    topic: { type: "string", description: "The article topic in one line" },
+    wikivoyage_searches: {
+      type: "array", items: { type: "string" }, maxItems: 3,
+      description: "0–3 short searches for Wikivoyage pages (destinations, districts, itineraries). Empty if not a place-based topic.",
+    },
+    wikipedia_searches: {
+      type: "array", items: { type: "string" }, minItems: 1, maxItems: 3,
+      description: "1–3 short searches for Wikipedia pages that give factual background",
+    },
+  },
+};
+
+/* ---------- Provider: Gemini ---------- */
 
 function geminiProvider() {
   const ai = new GoogleGenAI({
@@ -201,24 +276,31 @@ function geminiProvider() {
     name: `Gemini (${GEMINI_MODEL})`,
 
     async research(category, existingTitles) {
+      // 1. Gemini picks a topic and what to look up (no web access needed).
       const res = await ai.models.generateContent({
         model: GEMINI_MODEL,
-        contents: researchPrompt(category, existingTitles),
-        config: { systemInstruction: BRAND_VOICE, tools: [{ googleSearch: {} }] },
+        contents: `Today is ${new Date().toISOString().slice(0, 10)}.
+Pick ONE fresh article topic for the "${category}" category: ${CATEGORY_BRIEFS[category]}.
+It must not duplicate or closely overlap any of these existing articles:
+${existingTitles.length ? existingTitles.map((t) => `- ${t}`).join("\n") : "- (none yet)"}
+Choose a topic that Wikivoyage and Wikipedia cover well, and suggest short searches for those sites.
+Never choose a topic about ${EXCLUDED_TOPICS}.`,
+        config: { systemInstruction: BRAND_VOICE, responseMimeType: "application/json", responseJsonSchema: PLAN_SCHEMA },
       });
-      assertUsable(res, "Research");
+      assertUsable(res, "Planning");
+      const plan = parseArticleJson(res.text, "Planning");
+      console.log(`Topic: ${plan.topic}`);
 
-      const chunks = res.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
-      const sources = [];
-      const seen = new Set();
-      for (const chunk of chunks) {
-        if (!chunk.web?.uri) continue;
-        const url = await resolveSourceUrl(chunk.web.uri);
-        if (!url || seen.has(url)) continue;
-        seen.add(url);
-        sources.push({ url, title: chunk.web.title || new URL(url).hostname });
-      }
-      return { notes: res.text.trim(), sources };
+      // 2. The script fetches the real pages; these are the only research material and sources.
+      const sources = await collectWikiSources([
+        ...(plan.wikivoyage_searches ?? []).map((query) => ({ site: "en.wikivoyage.org", query })),
+        ...(plan.wikipedia_searches ?? []).map((query) => ({ site: "en.wikipedia.org", query })),
+      ]);
+      const notes = [
+        `TOPIC: ${plan.topic}`,
+        ...sources.map((s, i) => `[Source ${i + 1}] ${s.title} — ${s.url}\n${s.text}`),
+      ].join("\n\n");
+      return { notes, sources: sources.map(({ url, title }) => ({ url, title })) };
     },
 
     async write(category, notes, sources, feedback) {
@@ -240,6 +322,7 @@ function geminiProvider() {
       if (err.status === 429) return "Gemini free-tier limit reached (too many requests today or this minute). Try again later.";
       if (err.status === 400 && /api key/i.test(err.message)) return "GEMINI_API_KEY is invalid. Create a new key in Google AI Studio and update the secret.";
       if (err.status === 403) return "GEMINI_API_KEY is not allowed to use this model or API. Check the key in Google AI Studio.";
+      if (err.status === 404) return `Gemini model "${GEMINI_MODEL}" isn't available to this key. Set a GEMINI_MODEL variable to a current model (see ai.google.dev/gemini-api/docs/models). Details: ${err.message}`;
       return `Gemini API error ${err.status}: ${err.message}`;
     },
   };
