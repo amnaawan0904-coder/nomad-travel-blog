@@ -1,27 +1,34 @@
 /**
- * Daily article generator for Nomad Travel Blog.
+ * Article generator for Nomad Travel Blog.
  *
  *   1. Loads existing article titles from Supabase (to avoid duplicates).
- *   2. Research step: Claude + web search picks a fresh topic and gathers cited notes.
- *   3. Writing step: Claude turns the notes into a structured article (JSON).
- *   4. Validates it (sources, slug, no visa/price content) and saves it as a DRAFT.
+ *   2. Research step: the AI picks a fresh topic and researches it with web search.
+ *   3. Writing step: the AI turns the notes into a structured article (JSON).
+ *   4. Validates it (sources, length, slug, no visa/price content) and saves it as a DRAFT.
  *
  * Nothing is ever published by this script — a human reviews drafts in Supabase.
  *
+ * AI provider: Gemini when GEMINI_API_KEY is set (free tier: gemini-2.5-flash with Google Search),
+ * otherwise Claude via ANTHROPIC_API_KEY. Force one with AI_PROVIDER=gemini|claude.
+ *
  * Env vars (GitHub Actions secrets — never commit these):
- *   ANTHROPIC_API_KEY          Claude API key
+ *   GEMINI_API_KEY or ANTHROPIC_API_KEY
  *   SUPABASE_URL               https://<project>.supabase.co
  *   SUPABASE_SERVICE_ROLE_KEY  server-only key that can insert rows (never put it in the website)
  * Optional:
+ *   GEMINI_MODEL               defaults to gemini-2.5-flash (free-tier Google Search grounding)
  *   ANTHROPIC_MODEL            defaults to claude-opus-5-5
- *   DRY_RUN=1                  print the article instead of saving it
+ *   DRY_RUN=1                  show the article instead of saving it
  */
 import { appendFileSync } from "node:fs";
 import Anthropic from "@anthropic-ai/sdk";
+import { ApiError as GeminiApiError, GoogleGenAI } from "@google/genai";
 import { createClient } from "@supabase/supabase-js";
 
-const MODEL = process.env.ANTHROPIC_MODEL || "claude-opus-5-5";
 const DRY_RUN = process.env.DRY_RUN === "1";
+const PROVIDER = (process.env.AI_PROVIDER || (process.env.GEMINI_API_KEY?.trim() ? "gemini" : "claude")).toLowerCase();
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const CLAUDE_MODEL = process.env.ANTHROPIC_MODEL || "claude-opus-5-5";
 const MAX_PAUSE_CONTINUATIONS = 5;
 const MIN_SOURCES = 2;
 
@@ -60,6 +67,18 @@ function requireEnv(name) {
   return value;
 }
 
+/** The project API address, e.g. https://abcd1234.supabase.co — not a dashboard link. Never printed. */
+function supabaseUrl() {
+  const value = requireEnv("SUPABASE_URL").replace(/\/+$/, "");
+  if (!/^https:\/\/[a-z0-9-]+\.supabase\.co$/i.test(value)) {
+    throw new Error(
+      "SUPABASE_URL is not a Supabase project API address. It should look like https://<project-id>.supabase.co " +
+        "(Supabase → Project Settings → API), not a supabase.com/dashboard link.",
+    );
+  }
+  return value;
+}
+
 function todayCategory(date = new Date()) {
   const start = Date.UTC(date.getUTCFullYear(), 0, 0);
   const dayOfYear = Math.floor((date.getTime() - start) / 86_400_000);
@@ -77,39 +96,8 @@ function slugify(text) {
     .replace(/-+$/g, "");
 }
 
-function textOf(message) {
-  return message.content.filter((b) => b.type === "text").map((b) => b.text).join("");
-}
-
-/** Throws if Claude declined, so the run fails visibly instead of saving something empty. */
-function assertUsable(message, step) {
-  if (message.stop_reason === "refusal") {
-    const category = message.stop_details?.category ?? "unknown";
-    throw new Error(`${step}: Claude declined the request (refusal category: ${category}).`);
-  }
-  if (message.stop_reason === "max_tokens") {
-    throw new Error(`${step}: response hit max_tokens and was cut off.`);
-  }
-}
-
-/* ---------- Claude calls ---------- */
-
-const anthropic = new Anthropic({ apiKey: requireEnv("ANTHROPIC_API_KEY") });
-
-/** Shared request settings: server-side fallback on refusals, adaptive thinking (always on for this model). */
-const baseRequest = {
-  model: MODEL,
-  max_tokens: 16000,
-  betas: ["server-side-fallback-2026-07-01"],
-  fallbacks: "default",
-};
-
-/** Step 1 — research with web search. Returns notes plus the URLs Claude actually cited. */
-async function research(category, existingTitles) {
-  const messages = [
-    {
-      role: "user",
-      content: `Today is ${new Date().toISOString().slice(0, 10)}.
+function researchPrompt(category, existingTitles) {
+  return `Today is ${new Date().toISOString().slice(0, 10)}.
 
 Pick ONE fresh article topic for the "${category}" category: ${CATEGORY_BRIEFS[category]}.
 It must not duplicate or closely overlap any of these existing articles:
@@ -121,35 +109,23 @@ reputable publications, and recent sources. Do not research or note anything abo
 Reply with:
 TOPIC: <one line>
 NOTES: concise research notes — the key facts a writer needs, each one supported by your sources.
-Flag anything uncertain with "(unverified)".`,
-    },
-  ];
+Flag anything uncertain with "(unverified)".`;
+}
 
-  let response;
-  for (let attempt = 0; ; attempt++) {
-    response = await anthropic.beta.messages.create({
-      ...baseRequest,
-      system: BRAND_VOICE,
-      output_config: { effort: "high" },
-      tools: [{ type: "web_search_20260209", name: "web_search", max_uses: 8 }],
-      messages,
-    });
-    if (response.stop_reason !== "pause_turn") break;
-    if (attempt >= MAX_PAUSE_CONTINUATIONS) throw new Error("Research: too many pause_turn continuations.");
-    // Server-side search loop paused — send the turn back unchanged so it resumes.
-    messages.push({ role: "assistant", content: response.content });
-  }
-  assertUsable(response, "Research");
+function writingPrompt(category, notes, sources, feedback) {
+  return `Write one article for the "${category}" category using ONLY these research notes.
 
-  const cited = new Map(); // url -> title
-  for (const block of response.content) {
-    if (block.type !== "text" || !block.citations) continue;
-    for (const c of block.citations) {
-      if (c.type === "web_search_result_location" && c.url && !cited.has(c.url)) cited.set(c.url, c.title ?? c.url);
-    }
-  }
+<research_notes>
+${notes}
+</research_notes>
 
-  return { notes: textOf(response).trim(), sources: [...cited.entries()].map(([url, title]) => ({ url, title })) };
+<sources>
+${sources.map((s, i) => `${i + 1}. ${s.title} — ${s.url}`).join("\n")}
+</sources>
+
+Leave out anything marked (unverified). For source_urls, copy only URLs from the list above that the article relies on.${
+    feedback ? `\n\nYour previous draft was rejected: ${feedback} Fix this in the new draft.` : ""
+  }`;
 }
 
 const ARTICLE_SCHEMA = {
@@ -177,54 +153,186 @@ const ARTICLE_SCHEMA = {
   },
 };
 
-/** Step 2 — write the article as structured JSON from the research notes. */
-async function write(category, notes, sources, feedback) {
-  const response = await anthropic.beta.messages.create({
-    ...baseRequest,
-    system: BRAND_VOICE,
-    output_config: { effort: "high", format: { type: "json_schema", schema: ARTICLE_SCHEMA } },
-    messages: [
-      {
-        role: "user",
-        content: `Write one article for the "${category}" category using ONLY these research notes.
-
-<research_notes>
-${notes}
-</research_notes>
-
-<sources>
-${sources.map((s, i) => `${i + 1}. ${s.title} — ${s.url}`).join("\n")}
-</sources>
-
-Leave out anything marked (unverified). For source_urls, copy only URLs from the list above that the article relies on.${
-          feedback ? `\n\nYour previous draft was rejected: ${feedback} Fix this in the new draft.` : ""
-        }`,
-      },
-    ],
-  });
-  assertUsable(response, "Writing");
-
+function parseArticleJson(text, step) {
   try {
-    return JSON.parse(textOf(response));
+    return JSON.parse(text ?? "");
   } catch {
-    throw new Error("Writing: response was not valid JSON.");
+    throw new Error(`${step}: response was not valid JSON.`);
   }
+}
+
+/* ---------- Provider: Gemini ---------- */
+
+/**
+ * Gemini grounding returns temporary Google redirect links. Follow each one (without
+ * downloading the page) to get the real, permanent page address for source_urls.
+ */
+async function resolveSourceUrl(uri) {
+  try {
+    const res = await fetch(uri, { method: "GET", redirect: "manual", signal: AbortSignal.timeout(10_000) });
+    const location = res.headers.get("location");
+    await res.body?.cancel();
+    let finalUrl = null;
+    if (res.status >= 300 && res.status < 400 && location) finalUrl = new URL(location, uri).href;
+    else if (res.ok) finalUrl = uri;
+    return finalUrl && /^https?:\/\//i.test(finalUrl) && !/grounding-api-redirect/.test(finalUrl) ? finalUrl : null;
+  } catch {
+    return null;
+  }
+}
+
+function geminiProvider() {
+  const ai = new GoogleGenAI({
+    apiKey: requireEnv("GEMINI_API_KEY"),
+    // Only for local testing against a fake server; unset in GitHub Actions.
+    ...(process.env.GEMINI_BASE_URL ? { httpOptions: { baseUrl: process.env.GEMINI_BASE_URL } } : {}),
+  });
+
+  /** Throws if Gemini blocked or cut off the answer, so the run fails visibly. */
+  function assertUsable(res, step) {
+    const blocked = res.promptFeedback?.blockReason;
+    if (blocked) throw new Error(`${step}: Gemini blocked the request (${blocked}).`);
+    const reason = res.candidates?.[0]?.finishReason;
+    if (reason && reason !== "STOP") throw new Error(`${step}: Gemini stopped early (${reason}).`);
+    if (!res.text) throw new Error(`${step}: Gemini returned an empty response.`);
+  }
+
+  return {
+    name: `Gemini (${GEMINI_MODEL})`,
+
+    async research(category, existingTitles) {
+      const res = await ai.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: researchPrompt(category, existingTitles),
+        config: { systemInstruction: BRAND_VOICE, tools: [{ googleSearch: {} }] },
+      });
+      assertUsable(res, "Research");
+
+      const chunks = res.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
+      const sources = [];
+      const seen = new Set();
+      for (const chunk of chunks) {
+        if (!chunk.web?.uri) continue;
+        const url = await resolveSourceUrl(chunk.web.uri);
+        if (!url || seen.has(url)) continue;
+        seen.add(url);
+        sources.push({ url, title: chunk.web.title || new URL(url).hostname });
+      }
+      return { notes: res.text.trim(), sources };
+    },
+
+    async write(category, notes, sources, feedback) {
+      const res = await ai.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: writingPrompt(category, notes, sources, feedback),
+        config: {
+          systemInstruction: BRAND_VOICE,
+          responseMimeType: "application/json",
+          responseJsonSchema: ARTICLE_SCHEMA,
+        },
+      });
+      assertUsable(res, "Writing");
+      return parseArticleJson(res.text, "Writing");
+    },
+
+    describeError(err) {
+      if (!(err instanceof GeminiApiError)) return null;
+      if (err.status === 429) return "Gemini free-tier limit reached (too many requests today or this minute). Try again later.";
+      if (err.status === 400 && /api key/i.test(err.message)) return "GEMINI_API_KEY is invalid. Create a new key in Google AI Studio and update the secret.";
+      if (err.status === 403) return "GEMINI_API_KEY is not allowed to use this model or API. Check the key in Google AI Studio.";
+      return `Gemini API error ${err.status}: ${err.message}`;
+    },
+  };
+}
+
+/* ---------- Provider: Claude ---------- */
+
+function claudeProvider() {
+  const anthropic = new Anthropic({ apiKey: requireEnv("ANTHROPIC_API_KEY") });
+
+  /** Shared request settings: server-side fallback on refusals, adaptive thinking (always on for this model). */
+  const baseRequest = {
+    model: CLAUDE_MODEL,
+    max_tokens: 16000,
+    betas: ["server-side-fallback-2026-07-01"],
+    fallbacks: "default",
+  };
+
+  const textOf = (message) => message.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+
+  function assertUsable(message, step) {
+    if (message.stop_reason === "refusal") {
+      throw new Error(`${step}: Claude declined the request (refusal category: ${message.stop_details?.category ?? "unknown"}).`);
+    }
+    if (message.stop_reason === "max_tokens") throw new Error(`${step}: response hit max_tokens and was cut off.`);
+  }
+
+  return {
+    name: `Claude (${CLAUDE_MODEL})`,
+
+    async research(category, existingTitles) {
+      const messages = [{ role: "user", content: researchPrompt(category, existingTitles) }];
+      let response;
+      for (let attempt = 0; ; attempt++) {
+        response = await anthropic.beta.messages.create({
+          ...baseRequest,
+          system: BRAND_VOICE,
+          output_config: { effort: "high" },
+          tools: [{ type: "web_search_20260209", name: "web_search", max_uses: 8 }],
+          messages,
+        });
+        if (response.stop_reason !== "pause_turn") break;
+        if (attempt >= MAX_PAUSE_CONTINUATIONS) throw new Error("Research: too many pause_turn continuations.");
+        // Server-side search loop paused — send the turn back unchanged so it resumes.
+        messages.push({ role: "assistant", content: response.content });
+      }
+      assertUsable(response, "Research");
+
+      const cited = new Map(); // url -> title
+      for (const block of response.content) {
+        if (block.type !== "text" || !block.citations) continue;
+        for (const c of block.citations) {
+          if (c.type === "web_search_result_location" && c.url && !cited.has(c.url)) cited.set(c.url, c.title ?? c.url);
+        }
+      }
+      return { notes: textOf(response).trim(), sources: [...cited.entries()].map(([url, title]) => ({ url, title })) };
+    },
+
+    async write(category, notes, sources, feedback) {
+      const response = await anthropic.beta.messages.create({
+        ...baseRequest,
+        system: BRAND_VOICE,
+        output_config: { effort: "high", format: { type: "json_schema", schema: ARTICLE_SCHEMA } },
+        messages: [{ role: "user", content: writingPrompt(category, notes, sources, feedback) }],
+      });
+      assertUsable(response, "Writing");
+      return parseArticleJson(textOf(response), "Writing");
+    },
+
+    describeError(err) {
+      if (err instanceof Anthropic.AuthenticationError) return "Anthropic API key is missing or invalid.";
+      if (err instanceof Anthropic.RateLimitError) return "Anthropic rate limit reached — try again later.";
+      if (err instanceof Anthropic.APIError) return `Anthropic API error ${err.status}: ${err.message}`;
+      return null;
+    },
+  };
 }
 
 /* ---------- Validation ---------- */
 
 function validate(article, allowedUrls, takenSlugs) {
   const problems = [];
-  const sourceUrls = [...new Set(article.source_urls)].filter((u) => allowedUrls.has(u));
+  const sourceUrls = [...new Set(article.source_urls ?? [])].filter((u) => allowedUrls.has(u));
   if (sourceUrls.length < MIN_SOURCES) problems.push(`it cites only ${sourceUrls.length} researched source(s); at least ${MIN_SOURCES} are required.`);
 
-  const words = article.content.split(/\s+/).filter(Boolean).length;
+  const content = article.content ?? "";
+  const words = content.split(/\s+/).filter(Boolean).length;
   if (words < 600) problems.push(`it is too short (${words} words).`);
 
-  const banned = `${article.title}\n${article.excerpt}\n${article.content}`.match(EXCLUDED_PATTERN);
+  const banned = `${article.title}\n${article.excerpt}\n${content}`.match(EXCLUDED_PATTERN);
   if (banned) problems.push(`it mentions an excluded topic ("${banned[0]}") — the blog never covers visas or prices.`);
 
-  let slug = slugify(article.slug || article.title);
+  let slug = slugify(article.slug || article.title || "");
   if (!slug) problems.push("it has no usable slug.");
   for (let n = 2; takenSlugs.has(slug); n++) slug = `${slugify(article.slug || article.title).slice(0, 75)}-${n}`;
 
@@ -232,7 +340,7 @@ function validate(article, allowedUrls, takenSlugs) {
 }
 
 /** On GitHub Actions, shows the article on the run's Summary page (contains article text only, no secrets). */
-function writeRunSummary(row, saved) {
+function writeRunSummary(row, saved, providerName) {
   const file = process.env.GITHUB_STEP_SUMMARY;
   if (!file) return;
   const lines = [
@@ -240,6 +348,7 @@ function writeRunSummary(row, saved) {
     "",
     "| Field | Value |",
     "|---|---|",
+    `| Written by | ${providerName} |`,
     `| Category | ${row.category} |`,
     `| Slug | \`${row.slug}\` |`,
     `| Excerpt | ${row.excerpt.replace(/\|/g, "\\|")} |`,
@@ -259,8 +368,13 @@ function writeRunSummary(row, saved) {
 
 /* ---------- Main ---------- */
 
+let provider = null;
+
 async function main() {
-  const supabase = createClient(requireEnv("SUPABASE_URL"), requireEnv("SUPABASE_SERVICE_ROLE_KEY"), {
+  if (PROVIDER !== "gemini" && PROVIDER !== "claude") throw new Error(`AI_PROVIDER must be "gemini" or "claude".`);
+  provider = PROVIDER === "gemini" ? geminiProvider() : claudeProvider();
+
+  const supabase = createClient(supabaseUrl(), requireEnv("SUPABASE_SERVICE_ROLE_KEY"), {
     auth: { persistSession: false, autoRefreshToken: false },
   });
 
@@ -270,21 +384,21 @@ async function main() {
     .select("slug,title")
     .order("created_at", { ascending: false })
     .limit(300);
-  if (loadError) throw new Error(`Could not read existing articles: ${loadError.message}`);
+  if (loadError) throw new Error(`Could not read existing articles: ${loadError.message.slice(0, 300)}`);
 
   const takenSlugs = new Set(existing.map((a) => a.slug));
   const category = todayCategory();
-  console.log(`Category for today: ${category} · model: ${MODEL} · existing articles: ${existing.length}`);
+  console.log(`Category for today: ${category} · AI: ${provider.name} · existing articles: ${existing.length}`);
 
-  const { notes, sources } = await research(category, existing.map((a) => a.title));
-  console.log(`Research done: ${sources.length} cited source(s).`);
-  if (sources.length < MIN_SOURCES) throw new Error(`Research found only ${sources.length} citable source(s); skipping today.`);
+  const { notes, sources } = await provider.research(category, existing.map((a) => a.title));
+  console.log(`Research done: ${sources.length} source(s).`);
+  if (sources.length < MIN_SOURCES) throw new Error(`Research found only ${sources.length} usable source(s); skipping today.`);
 
   const allowedUrls = new Set(sources.map((s) => s.url));
-  let result = validate(await write(category, notes, sources), allowedUrls, takenSlugs);
+  let result = validate(await provider.write(category, notes, sources), allowedUrls, takenSlugs);
   if (result.problems.length) {
     console.warn(`First draft rejected: ${result.problems.join(" ")} Retrying once.`);
-    result = validate(await write(category, notes, sources, result.problems.join(" ")), allowedUrls, takenSlugs);
+    result = validate(await provider.write(category, notes, sources, result.problems.join(" ")), allowedUrls, takenSlugs);
   }
   if (result.problems.length) throw new Error(`Draft rejected: ${result.problems.join(" ")}`);
 
@@ -303,20 +417,17 @@ async function main() {
 
   if (DRY_RUN) {
     console.log("DRY_RUN=1 — not saving. Article:\n" + JSON.stringify(row, null, 2));
-    writeRunSummary(row, false);
+    writeRunSummary(row, false, provider.name);
     return;
   }
 
   const { error: insertError } = await supabase.from("articles").insert(row);
-  if (insertError) throw new Error(`Could not save draft: ${insertError.message}`);
-  writeRunSummary(row, true);
+  if (insertError) throw new Error(`Could not save draft: ${insertError.message.slice(0, 300)}`);
+  writeRunSummary(row, true, provider.name);
   console.log(`Saved draft "${row.title}" (/journal/${row.slug}). Review it in Supabase, then set status to 'scheduled' or 'published'.`);
 }
 
 main().catch((err) => {
-  if (err instanceof Anthropic.AuthenticationError) console.error("Anthropic API key is missing or invalid.");
-  else if (err instanceof Anthropic.RateLimitError) console.error("Anthropic rate limit reached — try again later.");
-  else if (err instanceof Anthropic.APIError) console.error(`Anthropic API error ${err.status}: ${err.message}`);
-  else console.error(err instanceof Error ? err.message : err);
+  console.error(provider?.describeError(err) ?? (err instanceof Error ? err.message : err));
   process.exit(1);
 });
