@@ -7,9 +7,9 @@
  *        Wikivoyage / Wikipedia pages (free, no key) as the only research material.
  *      - Claude: researches with its built-in web search.
  *   3. Writing step: the AI turns the research into a structured article (JSON).
- *   4. Validates it (sources, length, slug, no visa/price content) and saves it as a DRAFT.
- *
- * Nothing is ever published by this script — a human reviews drafts in Supabase.
+ *   4. Validates it (sources, length, slug, no visa/price content) and saves it —
+ *      as a DRAFT by default, or PUBLISHED (live on the site) when PUBLISH=1.
+ *      An article that fails validation is never saved at all.
  *
  * AI provider: Gemini when GEMINI_API_KEY is set, otherwise Claude via ANTHROPIC_API_KEY.
  * Force one with AI_PROVIDER=gemini|claude.
@@ -22,6 +22,7 @@
  *   GEMINI_MODEL               defaults to gemini-3.8-flash (free tier for text)
  *   ANTHROPIC_MODEL            defaults to claude-opus-5-5
  *   DRY_RUN=1                  show the article instead of saving it
+ *   PUBLISH=1                  save it as published instead of draft
  */
 import { appendFileSync } from "node:fs";
 import Anthropic from "@anthropic-ai/sdk";
@@ -29,6 +30,7 @@ import { ApiError as GeminiApiError, GoogleGenAI } from "@google/genai";
 import { createClient } from "@supabase/supabase-js";
 
 const DRY_RUN = process.env.DRY_RUN === "1";
+const PUBLISH = process.env.PUBLISH === "1";
 const PROVIDER = (process.env.AI_PROVIDER || (process.env.GEMINI_API_KEY?.trim() ? "gemini" : "claude")).toLowerCase();
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
 const CLAUDE_MODEL = process.env.ANTHROPIC_MODEL || "claude-opus-5-5";
@@ -427,7 +429,7 @@ function writeRunSummary(row, saved, providerName) {
   const file = process.env.GITHUB_STEP_SUMMARY;
   if (!file) return;
   const lines = [
-    `## ${saved ? "✅ Saved as draft" : "👀 Dry run — not saved"}: ${row.title}`,
+    `## ${!saved ? "👀 Dry run — not saved" : row.status === "published" ? "🚀 Published" : "✅ Saved as draft"}: ${row.title}`,
     "",
     "| Field | Value |",
     "|---|---|",
@@ -495,19 +497,24 @@ async function main() {
     seo_title: article.seo_title.trim(),
     seo_description: article.seo_description.trim(),
     source_urls: article.source_urls,
-    status: "draft", // never published automatically
+    // Drafts stay hidden until you publish them; PUBLISH=1 puts the article live straight away.
+    ...(PUBLISH ? { status: "published", published_at: new Date().toISOString() } : { status: "draft" }),
   };
 
   if (DRY_RUN) {
-    console.log("DRY_RUN=1 — not saving. Article:\n" + JSON.stringify(row, null, 2));
+    console.log(`DRY_RUN=1 — not saving (a real run would save it as ${row.status}). Article:\n` + JSON.stringify(row, null, 2));
     writeRunSummary(row, false, provider.name);
     return;
   }
 
   const { error: insertError } = await supabase.from("articles").insert(row);
-  if (insertError) throw new Error(`Could not save draft: ${insertError.message.slice(0, 300)}`);
+  if (insertError) throw new Error(`Could not save article: ${insertError.message.slice(0, 300)}`);
   writeRunSummary(row, true, provider.name);
-  console.log(`Saved draft "${row.title}" (/journal/${row.slug}). Review it in Supabase, then set status to 'scheduled' or 'published'.`);
+  console.log(
+    row.status === "published"
+      ? `Published "${row.title}" — it appears on the site at /journal/${row.slug} within about 5 minutes.`
+      : `Saved draft "${row.title}" (/journal/${row.slug}). Review it in Supabase, then set status to 'scheduled' or 'published'.`,
+  );
 }
 
 main().catch((err) => {
