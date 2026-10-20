@@ -1,21 +1,28 @@
 name: Daily articles
 
 on:
-  # Automatic: every day at 06:00 UTC (11:00 in Pakistan). GitHub may start a few minutes late.
-  # Scheduled runs PUBLISH the article (set repository variable AUTO_PUBLISH=false to save drafts instead).
   schedule:
-    - cron: "0 6 * * *"
-  # Manual: Actions tab → "Daily articles" → "Run workflow".
+    # Main run: 05:00 UTC = 10:00 Pakistan Standard Time. Creates and PUBLISHES 2 new travel articles.
+    - cron: "0 5 * * *"
+    # Backup run: 08:00 UTC = 13:00 PKT. GitHub can delay or drop scheduled runs when busy; this run only
+    # creates whatever is still missing for the day (usually nothing), so the site never gets more than 2 a day.
+    - cron: "0 8 * * *"
+  # Manual: Actions tab → "Daily articles" → "Run workflow" (optional — not needed for daily publishing).
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Dry run: generate and show the article, but don't save it to Supabase"
+        description: "Dry run: generate and show the article(s), but don't save them"
         type: boolean
         default: true
       publish:
-        description: "Publish immediately (otherwise it's saved as a draft). Ignored in a dry run."
+        description: "Publish immediately (otherwise saved as drafts). Ignored in a dry run."
         type: boolean
         default: false
+      articles:
+        description: "How many articles to create"
+        type: choice
+        options: ["1", "2"]
+        default: "1"
 
 # Never run two generations at the same time.
 concurrency:
@@ -28,20 +35,21 @@ permissions:
 
 jobs:
   generate:
-    name: Generate article
+    name: Generate travel articles
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       # Secrets are passed only as environment variables. GitHub masks their values in logs,
       # and the scripts never print them.
-      # AI: Gemini is used when GEMINI_API_KEY is set; otherwise Claude (ANTHROPIC_API_KEY).
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      # Optional repository variable (not a secret) to switch Gemini models without editing code.
-      GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      # Manual runs: follow the checkboxes. Scheduled runs: never a dry run.
+      # Optional repository variable (not a secret) to switch Gemini models without editing code.
+      GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+      # Scheduled runs: exactly 2 published articles per UTC day (set variable AUTO_PUBLISH=false for drafts).
+      DAILY_TARGET: ${{ github.event_name == 'schedule' && '2' || '' }}
+      # Manual runs: follow the checkboxes.
+      ARTICLES_PER_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.articles || '' }}
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '0' }}
       PUBLISH: ${{ ((github.event_name == 'schedule' && vars.AUTO_PUBLISH != 'false') || (github.event_name == 'workflow_dispatch' && inputs.publish)) && '1' || '0' }}
     steps:
@@ -49,7 +57,7 @@ jobs:
         # Reports only whether each secret exists — never its value.
         run: |
           missing=0
-          for name in SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY; do
+          for name in GEMINI_API_KEY SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY; do
             if [ -z "${!name}" ]; then
               echo "::error::Repository secret $name is not set (Settings → Secrets and variables → Actions)."
               missing=1
@@ -57,14 +65,6 @@ jobs:
               echo "✓ $name is set"
             fi
           done
-          if [ -n "$GEMINI_API_KEY" ]; then
-            echo "✓ GEMINI_API_KEY is set — using Gemini"
-          elif [ -n "$ANTHROPIC_API_KEY" ]; then
-            echo "✓ ANTHROPIC_API_KEY is set — using Claude"
-          else
-            echo "::error::Set a GEMINI_API_KEY (or ANTHROPIC_API_KEY) repository secret."
-            missing=1
-          fi
           exit $missing
 
       - uses: actions/checkout@v4
@@ -81,13 +81,13 @@ jobs:
       - name: Publish scheduled articles
         run: node scripts/publish-scheduled.mjs
 
-      - name: Generate article
+      - name: Generate travel articles
         run: |
           if [ "$DRY_RUN" = "1" ]; then
-            echo "Dry run: the article will be shown below and on the run summary page, but NOT saved."
+            echo "Dry run: article(s) will be shown below and on the run summary page, but NOT saved."
           elif [ "$PUBLISH" = "1" ]; then
-            echo "Live run: the article will be PUBLISHED and appear on the website."
+            echo "Live run: article(s) will be PUBLISHED to the website."
           else
-            echo "Live run: the article will be saved to Supabase as a DRAFT."
+            echo "Live run: article(s) will be saved to Supabase as DRAFTS."
           fi
           node scripts/generate-article.mjs
